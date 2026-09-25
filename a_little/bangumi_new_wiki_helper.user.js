@@ -10,7 +10,8 @@
 // @match      *://*/*
 // @author      zhifengle
 // @homepage    https://github.com/zhifengle/bangumi-new-wiki-helper
-// @version     0.6.0
+// @version     0.6.1
+// @note        支持从 VGMdb 艺术家 / 组织页面新建现实人物，可先查重
 // @note        0.4.27 支持音乐条目曲目列表
 // @note        0.3.0 使用 typescript 重构，浏览器扩展和脚本使用公共代码
 // @run-at      document-end
@@ -29,6 +30,9 @@
 
 
 function defineSiteIntegration(integration) {
+    return integration;
+}
+function definePersonIntegration(integration) {
     return integration;
 }
 
@@ -3767,6 +3771,395 @@ const steamdbIntegration = defineSiteIntegration({
 });
 
 // ref links
+// https://vgmdb.net/artist/1
+// https://vgmdb.net/artist/2
+// https://vgmdb.net/artist/3
+// 左栏资料行形如 <b>Birthdate</b><br>Mar 18, 1977；关键字命中 <b> 后回到整行
+function rowSelector(keyWord) {
+    return {
+        selector: '#leftfloat',
+        subSelector: 'div > b',
+        keyWord,
+        closest: 'div',
+    };
+}
+const vgmdbArtist = {
+    key: 'vgmdb_artist',
+    description: 'VGMdb 艺术家',
+    host: ['vgmdb.net'],
+    urlRules: [/vgmdb\.net\/artist\/\d+/],
+    pageSelectors: {
+        selector: '#innermain',
+        nextSelector: { selector: '#leftfloat' },
+    },
+    controlSelector: {
+        selector: '#innermain > span[style*="1.5em"]',
+    },
+    role: 1,
+    professions: ['artist'],
+    // 多值行（Aliases、Variations、Organizations）与姓名、简介、外链在 personTools 的 hook 里处理。
+    // 自由文本行只剥掉行首标签（k）和空白（t），默认管道会误删括号与冒号前的内容。
+    itemList: [
+        {
+            name: '生日',
+            selector: rowSelector('Birthdate'),
+            category: 'date',
+        },
+        {
+            name: '血型',
+            selector: rowSelector('Bloodtype'),
+            pipes: ['k', 't'],
+        },
+        {
+            name: '出生地',
+            selector: rowSelector('Birthplace'),
+            pipes: ['k', 't'],
+        },
+        {
+            name: '毕业院校',
+            selector: rowSelector('Education'),
+            pipes: ['k', 't'],
+        },
+        {
+            name: '肖像',
+            selector: { selector: '#leftfloat a.highslide' },
+            category: 'crt_cover',
+        },
+    ],
+};
+
+// ref links
+// https://vgmdb.net/org/1
+const vgmdbOrg = {
+    key: 'vgmdb_org',
+    description: 'VGMdb 组织',
+    host: ['vgmdb.net'],
+    urlRules: [/vgmdb\.net\/org\/\d+/],
+    pageSelectors: {
+        selector: 'dl',
+        nextSelector: { selector: 'dt.label' },
+    },
+    controlSelector: {
+        selector: 'h1[style*="display: inline"]',
+    },
+    role: 2,
+    professions: ['producer'],
+    // 名称、人物类型（按 Type 判断）与外链在 personTools 的 hook 里处理
+    itemList: [
+        {
+            name: '人物简介',
+            selector: {
+                selector: 'dl',
+                subSelector: 'dt',
+                keyWord: 'Description',
+                sibling: true,
+            },
+            category: 'crt_summary',
+        },
+        {
+            name: '肖像',
+            selector: { selector: 'a.highslide' },
+            category: 'crt_cover',
+        },
+    ],
+};
+
+const MONTHS = {
+    Jan: 1,
+    Feb: 2,
+    Mar: 3,
+    Apr: 4,
+    May: 5,
+    Jun: 6,
+    Jul: 7,
+    Aug: 8,
+    Sep: 9,
+    Oct: 10,
+    Nov: 11,
+    Dec: 12,
+};
+// VGMdb 只给出已知的部分（可能缺年或缺月日），按 Bangumi 惯用的 年月日 写法输出
+function formatBangumiBirthday(raw) {
+    const text = raw.trim();
+    let m = text.match(/^([A-Z][a-z]{2})[a-z]*\s+(\d{1,2}),\s*(\d{4})$/);
+    if (m && MONTHS[m[1]]) {
+        return `${m[3]}年${MONTHS[m[1]]}月${Number(m[2])}日`;
+    }
+    m = text.match(/^([A-Z][a-z]{2})[a-z]*\s+(\d{4})$/);
+    if (m && MONTHS[m[1]]) {
+        return `${m[2]}年${MONTHS[m[1]]}月`;
+    }
+    m = text.match(/^([A-Z][a-z]{2})[a-z]*\s+(\d{1,2})$/);
+    if (m && MONTHS[m[1]]) {
+        return `${MONTHS[m[1]]}月${Number(m[2])}日`;
+    }
+    m = text.match(/^(\d{4})$/);
+    if (m) {
+        return `${m[1]}年`;
+    }
+    m = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) {
+        return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
+    }
+    return text;
+}
+const JAPANESE_CHARS = /[぀-ヿ㐀-䶿一-鿿]/;
+// "折戸 伸治 (おりと しんじ)" → 姓名去空格，假名原样；不含日文字符的一律当作没有日文名
+function parseJapaneseName(raw) {
+    const text = raw.replace(/ /g, ' ').trim();
+    if (!text || !JAPANESE_CHARS.test(text)) {
+        return { name: '', kana: '' };
+    }
+    const m = text.match(/^(.+?)\s*[（(]\s*(.+?)\s*[)）]\s*$/);
+    const name = (m ? m[1] : text).replace(/\s+/g, '');
+    const kana = m ? m[2].trim() : '';
+    return { name, kana };
+}
+// Bangumi 的罗马字是姓在前；VGMdb 显示名是名在前，两个词时对调
+function toBangumiRomaji(displayName, hasJapaneseName) {
+    const text = displayName.trim();
+    const parts = text.split(/\s+/);
+    if (parts.length === 2) {
+        return `${parts[1]} ${parts[0]}`;
+    }
+    return text;
+}
+// person/new 的人物类型：同人社团、乐队组合算「组合」，其余按「公司」
+function resolveOrgRole(type) {
+    if (/doujin|circle|unit|group|band/i.test(type)) {
+        return 3;
+    }
+    return 2;
+}
+// VGMdb 外链形如 /redirect/<n>/<目标地址>，目标地址可能不带协议
+function cleanRedirectUrl(href) {
+    let url = href.replace(/^(?:https?:\/\/(?:www\.)?vgmdb\.net)?\/redirect\/\d+\//, '');
+    if (!/^https?:\/\//i.test(url)) {
+        url = `https://${url}`;
+    }
+    return url;
+}
+function cleanText(text) {
+    return (text ?? '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+}
+function isHidden(el) {
+    const style = el.getAttribute('style') ?? '';
+    return /display\s*:\s*none/i.test(style);
+}
+// 链接文字优先取可见的英文名 span；没有的话只收可见文本，避免把隐藏的日文变体一起带出来
+function readLabel(el) {
+    const visible = el.querySelector('span[lang="en"]');
+    return cleanText(visible ? visible.textContent : textWithLineBreaks(el));
+}
+// 读取 <b>标签</b><br>值 这类信息行里的所有值：按 <br> 切分文本，链接与子块各算一条
+function readRowValues(row) {
+    const values = [];
+    let buffer = '';
+    const flush = () => {
+        const value = cleanText(buffer);
+        if (value)
+            values.push(value);
+        buffer = '';
+    };
+    const walk = (node) => {
+        if (node.nodeType === 3) {
+            buffer += node.textContent ?? '';
+            return;
+        }
+        if (node.nodeType !== 1)
+            return;
+        const el = node;
+        const tag = el.tagName;
+        if (tag === 'B' || tag === 'IMG' || tag === 'EM' || isHidden(el))
+            return;
+        if (tag === 'BR') {
+            flush();
+            return;
+        }
+        if (tag === 'A' || tag === 'DIV') {
+            flush();
+            const label = readLabel(el);
+            if (label)
+                values.push(label);
+            return;
+        }
+        el.childNodes.forEach(walk);
+    };
+    row.childNodes.forEach(walk);
+    flush();
+    return values;
+}
+function findRow(root, label) {
+    return Array.from(root.querySelectorAll('#leftfloat > div')).find((div) => {
+        const b = div.querySelector('b');
+        return !!b && b.parentElement === div && cleanText(b.textContent) === label;
+    });
+}
+function textWithLineBreaks(el) {
+    let out = '';
+    const walk = (node) => {
+        if (node.nodeType === 3) {
+            out += node.textContent ?? '';
+            return;
+        }
+        if (node.nodeType !== 1)
+            return;
+        const child = node;
+        if (isHidden(child))
+            return;
+        if (child.tagName === 'BR') {
+            out += '\n';
+            return;
+        }
+        child.childNodes.forEach(walk);
+    };
+    el.childNodes.forEach(walk);
+    return out.replace(/ /g, ' ').replace(/[ \t]+\n/g, '\n').trim();
+}
+function readNotes(root) {
+    const heading = Array.from(root.querySelectorAll('#rightfloat h3')).find((h3) => cleanText(h3.textContent) === 'Notes');
+    const body = heading?.parentElement?.nextElementSibling?.querySelector('.smallfont');
+    if (!body)
+        return '';
+    const text = textWithLineBreaks(body);
+    if (/^No notes available/i.test(text))
+        return '';
+    return text;
+}
+const LINK_GROUPS_KEPT = new Set(['Official', 'Personal']);
+// Official 组第一条进官方网站，其余 Official 与 Personal 进链接块；X 统一写成 [X|url]
+function collectLinkInfos(root) {
+    const res = [];
+    let officialDone = false;
+    for (const label of Array.from(root.querySelectorAll('b.label'))) {
+        const group = cleanText(label.textContent);
+        if (!LINK_GROUPS_KEPT.has(group))
+            continue;
+        const container = label.parentElement;
+        if (!container)
+            continue;
+        for (const anchor of Array.from(container.querySelectorAll('span.link_doc a[rel="nofollow"]'))) {
+            const href = anchor.getAttribute('href');
+            if (!href)
+                continue;
+            const url = cleanRedirectUrl(href);
+            if (/web\.archive\.org/i.test(url))
+                continue;
+            const text = cleanText(anchor.textContent);
+            if (/^https?:\/\/(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\//i.test(url)) {
+                res.push({ name: '链接', value: `X|${url}`, category: 'listItem' });
+                continue;
+            }
+            if (group === 'Official' && !officialDone) {
+                officialDone = true;
+                res.push({ name: '官方网站', value: url });
+                continue;
+            }
+            res.push({
+                name: '链接',
+                value: `${text || url}|${url}`,
+                category: 'listItem',
+            });
+        }
+    }
+    return res;
+}
+function collectArtistInfos(root) {
+    const res = [];
+    const displayName = cleanText(root.querySelector('#innermain > span[style*="1.5em"]')?.textContent);
+    const jp = parseJapaneseName(root.querySelector('#leftfloat > span[style*="9pt"]')?.textContent ?? '');
+    if (jp.name) {
+        res.push({ name: '姓名', value: jp.name, category: 'crt_name' });
+        res.push({ name: '日文名', value: jp.name });
+        if (displayName && displayName !== jp.name) {
+            res.push({ name: '罗马字', value: toBangumiRomaji(displayName) });
+        }
+    }
+    else if (displayName) {
+        res.push({ name: '姓名', value: displayName, category: 'crt_name' });
+    }
+    if (jp.kana) {
+        res.push({ name: '纯假名', value: jp.kana });
+    }
+    const genderIcon = root.querySelector('#leftfloat img.inlineimg[title]');
+    const gender = cleanText(genderIcon?.getAttribute('title'));
+    if (/^male$/i.test(gender)) {
+        res.push({ name: '性别', value: '男' });
+    }
+    else if (/^female$/i.test(gender)) {
+        res.push({ name: '性别', value: '女' });
+    }
+    for (const label of ['Aliases', 'Variations']) {
+        const row = findRow(root, label);
+        if (!row)
+            continue;
+        for (const value of readRowValues(row)) {
+            res.push({ name: '别名', value, category: 'listItem' });
+        }
+    }
+    const orgRow = findRow(root, 'Organizations');
+    if (orgRow) {
+        for (const value of readRowValues(orgRow)) {
+            res.push({ name: '所属公司', value, category: 'listItem' });
+        }
+    }
+    const notes = readNotes(root);
+    if (notes) {
+        res.push({ name: '人物简介', value: notes, category: 'crt_summary' });
+    }
+    res.push(...collectLinkInfos(root));
+    return res;
+}
+function readOrgType(root) {
+    const dt = Array.from(root.querySelectorAll('dl dt.label')).find((item) => cleanText(item.textContent) === 'Type');
+    return cleanText(dt?.nextElementSibling?.textContent);
+}
+function collectOrgInfos(root) {
+    const res = [];
+    const name = cleanText(root.querySelector('h1[style*="display: inline"]')?.textContent);
+    if (name) {
+        res.push({ name: '姓名', value: name, category: 'crt_name' });
+    }
+    res.push({
+        name: 'crt_role',
+        value: String(resolveOrgRole(readOrgType(root))),
+        category: 'select',
+    });
+    res.push(...collectLinkInfos(root));
+    return res;
+}
+function resolveRoot(root) {
+    return root ?? document;
+}
+// 生日在抽取时已按 年月日 整理完，去掉 date 类目，
+// 否则填表时 convertInfoValue 会再用 dealDate 把它改回 ISO 格式
+function dropDateCategory(infos) {
+    return infos.map((info) => info.category === 'date' ? { name: info.name, value: info.value } : info);
+}
+const vgmdbArtistTools = {
+    hooks: {
+        async afterGetWikiData(infos, _model, root) {
+            return [
+                ...collectArtistInfos(resolveRoot(root)),
+                ...dropDateCategory(infos),
+            ];
+        },
+    },
+    filters: [{ category: 'date', dealFunc: formatBangumiBirthday }],
+};
+const vgmdbOrgTools = {
+    hooks: {
+        async afterGetWikiData(infos, _model, root) {
+            return [
+                ...collectOrgInfos(resolveRoot(root)),
+                ...dropDateCategory(infos),
+            ];
+        },
+    },
+    filters: [{ category: 'date', dealFunc: formatBangumiBirthday }],
+};
+
+// ref links
 // https://vgmdb.net/album/9683
 // https://vgmdb.net/album/134285
 // https://vgmdb.net/album/122607
@@ -4169,6 +4562,14 @@ const vgmdbIntegration = defineSiteIntegration({
     site: vgmdbSubject,
     tools: vgmdbTools,
 });
+const vgmdbArtistIntegration = definePersonIntegration({
+    model: vgmdbArtist,
+    tools: vgmdbArtistTools,
+});
+const vgmdbOrgIntegration = definePersonIntegration({
+    model: vgmdbOrg,
+    tools: vgmdbOrgTools,
+});
 
 const siteIntegrations = [
     getchuIntegration,
@@ -4189,6 +4590,11 @@ const siteIntegrations = [
     vgmdbIntegration,
 ];
 const characterIntegrations = siteIntegrations.flatMap((integration) => integration.characters ?? []);
+// 人物页面来源独立于条目站点注册，方便接入没有条目模型的站点。
+const personIntegrations = [
+    vgmdbArtistIntegration,
+    vgmdbOrgIntegration,
+];
 function buildSiteToolsMap(integrations) {
     return integrations.reduce((acc, integration) => {
         if (integration.tools) {
@@ -4205,11 +4611,39 @@ function buildCharacterToolsMap(integrations) {
         return acc;
     }, {});
 }
+function buildPersonToolsMap(integrations) {
+    return integrations.reduce((acc, integration) => {
+        if (integration.tools) {
+            acc[integration.model.key] = integration.tools;
+        }
+        return acc;
+    }, {});
+}
+// 条目与人物模型的 category 过滤器合并成一张按 ModelKey 索引的表，
+// 供核心抽取层按任意模型 key 查询。
+function buildFiltersMap(sites, persons) {
+    const acc = {};
+    for (const integration of sites) {
+        if (integration.tools?.filters) {
+            acc[integration.site.key] = integration.tools.filters;
+        }
+    }
+    for (const integration of persons) {
+        if (integration.tools?.filters) {
+            acc[integration.model.key] = integration.tools.filters;
+        }
+    }
+    return acc;
+}
 const siteToolsMap = buildSiteToolsMap(siteIntegrations);
 const characterToolsMap = buildCharacterToolsMap(characterIntegrations);
+const personToolsMap = buildPersonToolsMap(personIntegrations);
+const filtersMap = buildFiltersMap(siteIntegrations, personIntegrations);
 const noOpBeforeCreate = async () => true;
 const noOpSubjectAfterGetWikiData = async (infos) => infos;
 const noOpCharacterAfterGetWikiData = async (infos) => infos;
+const noOpPersonBeforeCreate = async () => true;
+const noOpPersonAfterGetWikiData = async (infos) => infos;
 function identity(x) {
     return x;
 }
@@ -4223,11 +4657,22 @@ function getCharacterModels(key) {
         .filter((integration) => integration.model.siteKey === key)
         .map((integration) => integration.model);
 }
+// host 命中且 urlRules（若有）命中当前页面地址的人物模型
+function findPersonModels(host, href) {
+    return personIntegrations
+        .map((integration) => integration.model)
+        .filter((model) => model.host.includes(host))
+        .filter((model) => !model.urlRules?.length ||
+        model.urlRules.some((rule) => rule.test(href)));
+}
 function getSiteTools(key) {
     return siteToolsMap[key];
 }
 function getCharacterTools(key) {
     return characterToolsMap[key];
+}
+function getPersonTools(key) {
+    return personToolsMap[key];
 }
 function getSubjectHooks(siteConfig, timing) {
     const hooks = getSiteTools(siteConfig.key)?.hooks;
@@ -4247,9 +4692,16 @@ function getCharacterHooks(config, timing = 'afterGetWikiData') {
     }
     return hooks[timing] || noOpCharacterAfterGetWikiData;
 }
+function getPersonHooks(model, timing) {
+    const hooks = getPersonTools(model.key)?.hooks;
+    const fallback = timing === 'beforeCreate'
+        ? noOpPersonBeforeCreate
+        : noOpPersonAfterGetWikiData;
+    return hooks?.[timing] || fallback;
+}
 function dealFuncByCategory(key, category) {
     const filter = category
-        ? getSiteTools(key)?.filters?.find((item) => item.category === category)
+        ? filtersMap[key]?.find((item) => item.category === category)
         : undefined;
     if (filter?.dealFunc) {
         return filter.dealFunc;
@@ -4257,20 +4709,25 @@ function dealFuncByCategory(key, category) {
     return (str = '') => identity((str ?? '').trim());
 }
 
+const DEFAULT_CONTROL_LABELS = {
+    create: '新建',
+    createWithCheck: '新建并查重',
+};
 /**
  * 插入控制的按钮
  * @param $t 父节点
  * @param cb 返回 Promise 的回调
+ * @param labels 按钮文案，人物等其他来源可以换掉默认的条目文案
  */
-function insertControlBtn($t, cb) {
+function insertControlBtn($t, cb, labels = DEFAULT_CONTROL_LABELS) {
     if (!$t)
         return;
     const $div = document.createElement('div');
     const $s = document.createElement('span');
     $s.classList.add('e-wiki-new-subject');
-    $s.innerHTML = '新建';
+    $s.innerHTML = labels.create;
     const $search = $s.cloneNode();
-    $search.innerHTML = '新建并查重';
+    $search.innerHTML = labels.createWithCheck;
     $div.appendChild($s);
     $div.appendChild($search);
     $t.insertAdjacentElement('afterend', $div);
@@ -4278,7 +4735,7 @@ function insertControlBtn($t, cb) {
         await cb(e);
     });
     $search.addEventListener('click', async (e) => {
-        if ($search.innerHTML !== '新建并查重')
+        if ($search.innerHTML !== labels.createWithCheck)
             return;
         $search.innerHTML = '查重中...';
         try {
@@ -4292,7 +4749,7 @@ function insertControlBtn($t, cb) {
         }
         finally {
             if ($search.innerHTML === '查重中...') {
-                $search.innerHTML = '新建并查重';
+                $search.innerHTML = labels.createWithCheck;
             }
         }
     });
@@ -4657,6 +5114,12 @@ async function getCharaData(model, context = {}) {
     const rawInfo = await getWikiItems(model.itemList, model.siteKey, context);
     const defaultInfos = model.defaultInfos || [];
     const hookRes = await getCharacterHooks(model, 'afterGetWikiData')(rawInfo, model, context.root);
+    return [...applyHookResult(rawInfo, hookRes), ...defaultInfos];
+}
+async function getPersonData(model, context = {}) {
+    const rawInfo = await getWikiItems(model.itemList, model.key, context);
+    const defaultInfos = model.defaultInfos || [];
+    const hookRes = await getPersonHooks(model, 'afterGetWikiData')(rawInfo, model, context.root);
     return [...applyHookResult(rawInfo, hookRes), ...defaultInfos];
 }
 
@@ -5119,6 +5582,73 @@ async function updateSubjectDraftFromAuxSite(payload, runtime) {
             cmd: 'dismissNotError',
         });
     }
+}
+
+// 人物查重走新版 API，匿名即可调用，与 bgm.tv / chii.in 的站点域名无关
+const PERSON_SEARCH_URL = 'https://api.bgm.tv/v0/search/persons?limit=10';
+function isPersonSearchHit(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+    const hit = value;
+    return ((typeof hit.id === 'number' || typeof hit.id === 'string') &&
+        typeof hit.name === 'string');
+}
+async function searchPersonCandidates(name) {
+    const keyword = name.trim();
+    if (!keyword) {
+        return [];
+    }
+    const response = await fetchJson(PERSON_SEARCH_URL, {
+        method: 'POST',
+        data: JSON.stringify({ keyword }),
+        headers: { 'Content-Type': 'application/json' },
+    });
+    const hits = Array.isArray(response?.data) ? response.data : [];
+    return hits.filter(isPersonSearchHit).map((hit) => ({
+        name: hit.name,
+        greyName: hit.name_cn ?? '',
+        url: `/person/${hit.id}`,
+    }));
+}
+
+// 与条目的 checkSubjectAndOpenEntry 同一套流程：
+// 搜到就打开已有人物，搜不到才打开 person/new；候选筛选沿用 filterResults。
+async function checkPersonAndOpenEntry(payload, runtime) {
+    const name = payload.name?.trim() ?? '';
+    if (!name) {
+        await runtime.openNewPerson();
+        return;
+    }
+    await runtime.notify({
+        type: 'info',
+        message: `搜索中...<br/>${name}`,
+        duration: 0,
+    });
+    let result;
+    try {
+        const candidates = await searchPersonCandidates(name);
+        // 与条目一致：filterResults 用姓名直接建正则，特殊字符会抛错，也算搜索失败
+        result = filterResults(candidates, { name }, {
+            keys: ['name', 'greyName'],
+        });
+        await runtime.notify({ type: 'info', message: '', cmd: 'dismissNotError' });
+    }
+    catch (error) {
+        console.error('person search failed:', error);
+        await runtime.notify({
+            type: 'error',
+            message: `Bangumi 人物搜索失败: <br/><b>${name}</b>`,
+            cmd: 'dismissNotError',
+        });
+        throw error;
+    }
+    console.info('person search result: ', result);
+    if (result?.url) {
+        await runtime.discardPersonDraft();
+        await runtime.openExistingPerson(result.url);
+        return;
+    }
+    await runtime.openNewPerson();
 }
 
 function sleep(num) {
@@ -5992,6 +6522,7 @@ const SCRIPT_PREFIX = 'E_USERJS_';
 const AUTO_FILL_FORM = SCRIPT_PREFIX + 'autofill';
 const WIKI_DATA = SCRIPT_PREFIX + 'wiki_data';
 const CHARA_DATA = SCRIPT_PREFIX + 'chara_data';
+const PERSON_DATA = SCRIPT_PREFIX + 'person_data';
 const PROTOCOL = SCRIPT_PREFIX + 'protocol';
 const BGM_DOMAIN = SCRIPT_PREFIX + 'bgm_domain';
 const SUBJECT_ID = SCRIPT_PREFIX + 'subject_id';
@@ -6010,6 +6541,15 @@ const userScriptDraftStore = {
     async loadCharacterDraft() {
         return JSON.parse(GM_getValue(CHARA_DATA) || 'null');
     },
+    async savePersonDraft(personData) {
+        GM_setValue(PERSON_DATA, JSON.stringify(personData));
+    },
+    async loadPersonDraft() {
+        return JSON.parse(GM_getValue(PERSON_DATA) || 'null');
+    },
+    async clearPersonDraft() {
+        GM_deleteValue(PERSON_DATA);
+    },
     async saveSubjectId(subjectId) {
         GM_setValue(SUBJECT_ID, subjectId);
     },
@@ -6020,6 +6560,7 @@ const userScriptDraftStore = {
         return {
             wikiData: JSON.parse(GM_getValue(WIKI_DATA) || 'null'),
             charaData: JSON.parse(GM_getValue(CHARA_DATA) || 'null'),
+            personData: JSON.parse(GM_getValue(PERSON_DATA) || 'null'),
             subjectId: GM_getValue(SUBJECT_ID),
             shouldAutoFill: GM_getValue(AUTO_FILL_FORM) == 1,
             autoFillDelay: 300,
@@ -6029,6 +6570,7 @@ const userScriptDraftStore = {
         GM_deleteValue(AUTO_FILL_FORM);
         GM_deleteValue(WIKI_DATA);
         GM_deleteValue(CHARA_DATA);
+        GM_deleteValue(PERSON_DATA);
         GM_deleteValue(SUBJECT_ID);
     },
     async consumeAutoFill() {
@@ -6127,12 +6669,45 @@ function createUserScriptSubjectCreationRuntime(host) {
         },
     };
 }
+function createUserScriptPersonCreationRuntime(host) {
+    const notify = userScriptRuntimeCapabilities.notifier?.notify ?? logMessage;
+    const openTab = getOpenTab();
+    return {
+        bangumi: {
+            host,
+        },
+        notify,
+        discardPersonDraft() {
+            return userScriptRuntimeCapabilities.storage.clearPersonDraft();
+        },
+        async openExistingPerson(url) {
+            await sleep(100);
+            await openTab(host + url);
+        },
+        async openNewPerson() {
+            GM_setValue(AUTO_FILL_FORM, 1);
+            await sleep(200);
+            await openTab(`${host}/person/new`);
+        },
+    };
+}
+async function submitPersonCreation({ personData, queryInfo, shouldCheckDup, }) {
+    const host = getBangumiHost();
+    const personCreationRuntime = createUserScriptPersonCreationRuntime(host);
+    await userScriptRuntimeCapabilities.storage.savePersonDraft(personData);
+    if (shouldCheckDup) {
+        await checkPersonAndOpenEntry({ name: queryInfo.name }, personCreationRuntime);
+        return;
+    }
+    await personCreationRuntime.openNewPerson();
+}
 const userScriptRuntimeAdapter = {
     fetchHtml(url) {
         return userScriptRuntimeCapabilities.transport.fetchHtml(url);
     },
     submitSubjectCreation,
     submitCharacterCreation,
+    submitPersonCreation,
 };
 
 async function initCommon(siteConfig) {
@@ -7500,6 +8075,51 @@ function initCharacterSubmit(wikiInfo, dataUrl) {
         });
     }, 300);
 }
+function hasPortrait($canvas) {
+    return !!$canvas && $canvas.width > 8 && $canvas.height > 10;
+}
+// 人物页没有关联条目与 CV 的步骤；没有肖像时也允许直接提交表单
+function initPersonSubmit(dataUrl, deps = {}) {
+    const navigate = deps.navigate ?? ((url) => location.assign(url));
+    setTimeout(() => {
+        const $form = $q('form[name=new_character]');
+        const $input = $q('.e-wiki-cover-container [name=submit]');
+        if (!$form || !$input)
+            return;
+        const $clonedInput = $input.cloneNode(true);
+        $clonedInput.value = '添加人物并上传肖像';
+        $input.insertAdjacentElement('afterend', $clonedInput);
+        $input.remove();
+        const $canvas = $q('#e-wiki-cover-preview');
+        $clonedInput.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const $el = e.target;
+            $el.style.display = 'none';
+            $clonedInput.style.display = 'none';
+            const $loading = insertLoading($el);
+            try {
+                const $wikiMode = $q('table small a:nth-of-type(1)[href="javascript:void(0)"]');
+                $wikiMode?.click();
+                await sleep(200);
+                const url = hasPortrait($canvas)
+                    ? await sendFormImg($form, $canvas.toDataURL('image/png', 1) || dataUrl)
+                    : await sendForm($form);
+                insertLogInfo($el, `新建人物成功: ${genLinkText(url, '人物地址')}`);
+                $loading.remove();
+                $el.style.display = '';
+                $clonedInput.style.display = '';
+                navigate(url);
+            }
+            catch (e) {
+                console.log('send form err: ', e);
+                insertLogInfo($el, `出错了: ${e}`);
+                $loading.remove();
+                $el.style.display = '';
+                $clonedInput.style.display = '';
+            }
+        });
+    }, 300);
+}
 
 const SUBJECT_TYPE_INPUT_SELECTOR = 'table tr:nth-of-type(2) > td:nth-of-type(2) input';
 const SUBJECT_TITLE_SELECTOR = 'input[name=subject_title]';
@@ -7524,6 +8144,13 @@ const SUBJECT_NAME_MAP = {
 };
 function getInput(selector) {
     return $q(selector);
+}
+// 表单字段名可能带方括号（如 prsn_pro[artist]），必须放进带引号的属性选择器里
+function escapeAttrValue(value) {
+    return value.replace(/["\\]/g, '\\$&');
+}
+function getFieldByName(tag, name) {
+    return $q(`${tag}[name="${escapeAttrValue(name)}"]`);
 }
 function getTextArea(selector) {
     return $q(selector);
@@ -7591,7 +8218,10 @@ async function fillInfoBox(wikiData) {
     const { infos } = wikiData;
     const subType = Number(wikiData.subtype);
     const infoArray = [];
-    const typeInputs = Array.from($qa(SUBJECT_TYPE_INPUT_SELECTOR));
+    // 只有条目草稿才有类型单选；角色、人物页面的表格第二行是别的输入框
+    const typeInputs = wikiData.type === undefined
+        ? []
+        : Array.from($qa(SUBJECT_TYPE_INPUT_SELECTOR));
     if (typeInputs.length) {
         typeInputs[0]?.click();
         if (!Number.isNaN(subType)) {
@@ -7621,9 +8251,16 @@ async function fillInfoBox(wikiData) {
             continue;
         }
         if (currentInfo.category === 'checkbox') {
-            const target = getInput(`input[name=${currentInfo.name}]`);
+            const target = getFieldByName('input', currentInfo.name);
             if (target) {
                 target.checked = Boolean(currentInfo.value);
+            }
+            continue;
+        }
+        if (currentInfo.category === 'select') {
+            const target = getFieldByName('select', currentInfo.name);
+            if (target) {
+                target.value = infoValue;
             }
             continue;
         }
@@ -7700,6 +8337,36 @@ function initNewCharacter(wikiInfo, _subjectId) {
     }
     initCharacterSubmit(wikiInfo, dataUrl);
 }
+function getPortraitDataUrl(infos) {
+    const coverInfo = infos.find((item) => item.category === 'crt_cover');
+    if (!coverInfo || !coverInfo.value) {
+        return '';
+    }
+    if (isCoverValue(coverInfo.value)) {
+        return getCoverValue(coverInfo.value)?.dataUrl || '';
+    }
+    return getStringValue(coverInfo.value);
+}
+// person/new 与 character/new 共用 form[name=new_character]，字段名也相同
+function initNewPerson(wikiInfo) {
+    const titleInput = getElement(CHARACTER_TITLE_PARENT_SELECTOR);
+    const parent = titleInput?.parentElement;
+    if (!parent) {
+        return;
+    }
+    const defaultVal = getInfoBoxValue();
+    insertFillFormBtn(parent, async () => {
+        await fillInfoBox(wikiInfo);
+    }, () => {
+        resetCharacterForm(defaultVal);
+    });
+    const dataUrl = getPortraitDataUrl(wikiInfo.infos);
+    const personForm = getElement(CHARACTER_FORM_SELECTOR);
+    if (personForm) {
+        initImageWidget(personForm, dataUrl);
+    }
+    initPersonSubmit(dataUrl);
+}
 function initUploadImg(wikiInfo) {
     const coverInfo = wikiInfo.infos.filter((item) => item.category === 'cover')[0];
     const uploadForm = getElement(UPLOAD_FORM_SELECTOR);
@@ -7709,7 +8376,13 @@ function initUploadImg(wikiInfo) {
 }
 
 function getPageType() {
-    const re = new RegExp(['new_subject', 'add_related', 'character/new', 'upload_img'].join('|'));
+    const re = new RegExp([
+        'new_subject',
+        'add_related',
+        'character/new',
+        'person/new',
+        'upload_img',
+    ].join('|'));
     return document.location.href.match(re)?.[0] || '';
 }
 function getEmptySubjectInfo() {
@@ -7759,6 +8432,14 @@ async function initBangumiPage(runtime) {
         case 'character/new':
             if (state.charaData) {
                 initNewCharacter(state.charaData, state.subjectId);
+                if (state.shouldAutoFill) {
+                    triggerAutoFill(runtime, state.autoFillDelay);
+                }
+            }
+            break;
+        case 'person/new':
+            if (state.personData) {
+                initNewPerson(state.personData);
                 if (state.shouldAutoFill) {
                     triggerAutoFill(runtime, state.autoFillDelay);
                 }
@@ -7891,6 +8572,73 @@ async function initSourceCharacter(siteConfig, runtime) {
 
 async function initChara(siteConfig) {
     return initSourceCharacter(siteConfig, userScriptRuntimeAdapter);
+}
+
+const PERSON_BUTTON_LABELS = {
+    create: '新建人物',
+    createWithCheck: '新建人物并查重',
+};
+// 站点 hook 没给的项才补默认值：人物类型下拉、职业勾选、引用来源
+function withDefaults(infos, model) {
+    const res = [...infos];
+    if (model.role !== undefined && !res.some((info) => info.name === 'crt_role')) {
+        res.push({ name: 'crt_role', value: String(model.role), category: 'select' });
+    }
+    if (!res.some((info) => info.category === 'checkbox')) {
+        for (const profession of model.professions ?? []) {
+            res.push({
+                name: `prsn_pro[${profession}]`,
+                value: true,
+                category: 'checkbox',
+            });
+        }
+    }
+    if (!res.some((info) => info.name === '引用来源')) {
+        // 只记页面本身的地址，去掉查询串与锚点
+        res.push({
+            name: '引用来源',
+            value: location.origin + location.pathname,
+            category: 'listItem',
+        });
+    }
+    return res;
+}
+function getPersonName(infos) {
+    return getStringValue(infos.find((info) => info.category === 'crt_name')?.value).trim();
+}
+async function initSourcePerson(model, runtime) {
+    const $page = findElement(model.pageSelectors);
+    if (!$page)
+        return;
+    const $control = findElement(model.controlSelector);
+    if (!$control)
+        return;
+    const canCreate = await getPersonHooks(model, 'beforeCreate')();
+    if (!canCreate)
+        return;
+    console.info(model.description, ' person content script init');
+    insertControlBtn($control, async (_e, shouldCheckDup) => {
+        const infos = withDefaults(await getPersonData(model, createWikiExtractContext(document)), model);
+        // 人物允许没有肖像；补抓失败只降级为不带图，不中断新建
+        try {
+            await runtime.hydratePersonCover?.(infos);
+        }
+        catch (error) {
+            console.warn('person portrait hydration failed, continuing without it:', error);
+        }
+        console.info('person info list: ', infos);
+        const personData = { infos };
+        await runtime.submitPersonCreation({
+            siteConfig: model,
+            personData,
+            queryInfo: { name: getPersonName(infos) },
+            shouldCheckDup: !!shouldCheckDup,
+        });
+    }, PERSON_BUTTON_LABELS);
+}
+
+async function initPerson(model) {
+    return initSourcePerson(model, userScriptRuntimeAdapter);
 }
 
 const BANGUMI_DOMAINS = ['bgm.tv', 'bangumi.tv', 'chii.in'];
@@ -8145,16 +8893,30 @@ if (GM_registerMenuCommand) {
 }
 const init = async () => {
     const host = window.location.hostname;
+    let styled = false;
+    const ensureStyle = () => {
+        if (!styled) {
+            addStyle();
+            styled = true;
+        }
+    };
     const modelArr = findModelByHost(host);
     if (modelArr && modelArr.length) {
-        addStyle();
+        ensureStyle();
         modelArr.forEach((m) => {
             initCommon(m);
             initChara(m);
         });
     }
+    const personModels = findPersonModels(host, window.location.href);
+    if (personModels.length) {
+        ensureStyle();
+        personModels.forEach((m) => {
+            initPerson(m);
+        });
+    }
     if (['bangumi.tv', 'chii.in', 'bgm.tv'].includes(host)) {
-        addStyle();
+        ensureStyle();
         bangumi.init();
     }
 };
